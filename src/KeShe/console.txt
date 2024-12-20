@@ -1,0 +1,191 @@
+CREATE DATABASE 运动会管理系统;
+
+USE 运动会管理系统;
+
+-- 学院表
+CREATE TABLE 学院 (
+    学院编号 BIGINT PRIMARY KEY AUTO_INCREMENT,
+    学院名称 VARCHAR(100) NOT NULL,
+    领队名称 VARCHAR(100),
+    总积分 BIGINT DEFAULT 0 CHECK (总积分 >= 0),
+    排名 BIGINT DEFAULT 0 CHECK (排名 >= 0)
+);
+
+-- 运动员表
+CREATE TABLE 运动员 (
+    运动员编号 BIGINT PRIMARY KEY AUTO_INCREMENT,
+    运动员姓名 VARCHAR(100) NOT NULL,
+    学院编号 BIGINT,
+    FOREIGN KEY (学院编号) REFERENCES 学院(学院编号) ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- 比赛项目表
+CREATE TABLE 比赛项目 (
+    项目编号 BIGINT PRIMARY KEY AUTO_INCREMENT,
+    项目名称 VARCHAR(100) NOT NULL,
+    项目类型 VARCHAR(50)
+);
+
+-- 比赛成绩表
+CREATE TABLE 比赛成绩 (
+    成绩编号 BIGINT PRIMARY KEY AUTO_INCREMENT,
+    运动员编号 BIGINT,
+    项目编号 BIGINT,
+    成绩 FLOAT CHECK (成绩 >= 0),
+    积分 BIGINT CHECK (积分 >= 0),
+    FOREIGN KEY (运动员编号) REFERENCES 运动员(运动员编号) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (项目编号) REFERENCES 比赛项目(项目编号) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- 创建用户表
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(50) NOT NULL,
+    password VARCHAR(50) NOT NULL,
+    role VARCHAR(20) NOT NULL
+);
+
+-- 插入示例用户
+INSERT INTO users (username, password, role) VALUES ('admin', 'admin_password', 'admin');
+INSERT INTO users (username, password, role) VALUES ('athlete', 'athlete_password', 'athlete');
+INSERT INTO users (username, password, role) VALUES ('judge', 'judge_password', 'judge');
+
+DROP USER IF EXISTS 'athlete'@'localhost';
+DROP USER IF EXISTS 'judge'@'localhost';
+DROP USER IF EXISTS 'admin'@'localhost';
+
+-- 创建用户和分配权限
+CREATE USER 'athlete'@'localhost' IDENTIFIED BY 'athlete_password';
+GRANT SELECT ON 运动会管理系统.* TO 'athlete'@'localhost';
+
+CREATE USER 'judge'@'localhost' IDENTIFIED BY 'judge_password';
+GRANT SELECT, INSERT ON 运动会管理系统.* TO 'judge'@'localhost';
+
+CREATE USER 'admin'@'localhost' IDENTIFIED BY 'admin_password';
+GRANT ALL PRIVILEGES ON 运动会管理系统.* TO 'admin'@'localhost';
+
+FLUSH PRIVILEGES;
+
+-- 使用CHECK约束来确保数据的完整性
+ALTER TABLE 学院
+    ADD CONSTRAINT chk_总积分 CHECK (总积分 >= 0),
+    ADD CONSTRAINT chk_排名 CHECK (排名 >= 0);
+
+ALTER TABLE 比赛成绩
+    ADD CONSTRAINT chk_成绩 CHECK (成绩 >= 0),
+    ADD CONSTRAINT chk_积分 CHECK (积分 >= 0);
+
+-- 创建存储过程
+DELIMITER //
+
+CREATE PROCEDURE UpdateCollegeRanking()
+BEGIN
+    -- 使用用户定义变量来重置排名
+    SET @rank := 0;
+
+    -- 重置所有学院的排名
+    UPDATE 学院
+    SET 排名 = 0
+    WHERE 学院编号 IS NOT NULL;
+
+    -- 更新学院排名
+    UPDATE 学院 a
+        JOIN (
+            SELECT 学院编号, (@rank := @rank + 1) AS 排名
+            FROM 学院
+            ORDER BY 总积分 DESC
+        ) b ON a.学院编号 = b.学院编号
+    SET a.排名 = b.排名
+    WHERE a.学院编号 = b.学院编号;
+END //
+
+DELIMITER ;
+
+-- 创建事件调度器定期执行存储过程
+DELIMITER //
+
+CREATE EVENT UpdateRankingEvent
+    ON SCHEDULE EVERY 1 DAY
+    DO
+    BEGIN
+        CALL UpdateCollegeRanking();
+    END //
+
+DELIMITER ;
+
+-- 创建触发器
+DELIMITER //
+
+-- 删除学院触发器
+CREATE TRIGGER trg_delete_college
+    BEFORE DELETE ON 学院
+    FOR EACH ROW
+BEGIN
+    UPDATE 运动员 SET 学院编号 = NULL WHERE 学院编号 = OLD.学院编号;
+END //
+
+-- 删除运动员触发器
+CREATE TRIGGER trg_delete_athlete
+    BEFORE DELETE ON 运动员
+    FOR EACH ROW
+BEGIN
+    DELETE FROM 比赛成绩 WHERE 运动员编号 = OLD.运动员编号;
+END //
+
+-- 删除比赛项目触发器
+CREATE TRIGGER trg_delete_event
+    BEFORE DELETE ON 比赛项目
+    FOR EACH ROW
+BEGIN
+    DELETE FROM 比赛成绩 WHERE 项目编号 = OLD.项目编号;
+END //
+
+-- 插入成绩时更新学院积分和排名
+CREATE TRIGGER trg_insert_performance
+    AFTER INSERT ON 比赛成绩
+    FOR EACH ROW
+BEGIN
+    -- 更新学院的总积分
+    UPDATE 学院
+    SET 总积分 = 总积分 + NEW.积分
+    WHERE 学院编号 = (SELECT 学院编号 FROM 运动员 WHERE 运动员编号 = NEW.运动员编号);
+
+    -- 更新学院排名
+    CALL UpdateCollegeRanking();
+END //
+
+-- 更新成绩时更新学院积分和排名
+CREATE TRIGGER trg_update_performance
+    BEFORE UPDATE ON 比赛成绩
+    FOR EACH ROW
+BEGIN
+    DECLARE old_points BIGINT;
+    DECLARE new_points BIGINT;
+
+    SET old_points = OLD.积分;
+    SET new_points = NEW.积分;
+
+    IF old_points <> new_points THEN
+        UPDATE 学院
+        SET 总积分 = 总积分 - old_points + new_points
+        WHERE 学院编号 = (SELECT 学院编号 FROM 运动员 WHERE 运动员编号 = OLD.运动员编号);
+    END IF;
+
+    -- 更新学院排名
+    CALL UpdateCollegeRanking();
+END //
+
+-- 删除成绩时更新学院积分和排名
+CREATE TRIGGER trg_delete_performance
+    BEFORE DELETE ON 比赛成绩
+    FOR EACH ROW
+BEGIN
+    UPDATE 学院
+    SET 总积分 = 总积分 - OLD.积分
+    WHERE 学院编号 = (SELECT 学院编号 FROM 运动员 WHERE 运动员编号 = OLD.运动员编号);
+
+    -- 更新学院排名
+    CALL UpdateCollegeRanking();
+END //
+
+DELIMITER ;
